@@ -17,6 +17,8 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"io"
 	"log"
 	"os/exec"
@@ -38,10 +40,14 @@ func makeSSHSessionHandler(shell string) ssh.Handler {
 		case len(s.Command()) > 0:
 			log.Printf("No PTY requested, executing command: '%s'", s.RawCommand())
 
-			cmd := exec.Command(s.Command()[0], s.Command()[1:]...)
-			// We use StdinPipe to avoid blocking on missing input
+			var (
+				ctx, cancel = context.WithCancel(context.Background())
+				cmd         = exec.CommandContext(ctx, s.Command()[0], s.Command()[1:]...)
+			)
+			defer cancel()
+
 			if stdin, err := cmd.StdinPipe(); err != nil {
-				log.Println("Could not initialize StdInPipe", err)
+				log.Println("Could not initialize StdinPipe", err)
 				s.Exit(1)
 				return
 			} else {
@@ -49,34 +55,57 @@ func makeSSHSessionHandler(shell string) ssh.Handler {
 					if _, err := io.Copy(stdin, s); err != nil {
 						log.Printf("Error while copying input from %s to stdin: %s", s.RemoteAddr().String(), err)
 					}
-					if err := stdin.Close(); err != nil {
-						log.Println("Error while closing stdinPipe:", err)
-					}
+					// When the copy returns, kill the child process
+					// by cancelling the context. Everything is cleaned
+					// up automatically.
+					cancel()
 				}()
 			}
+
 			cmd.Stdout = s
 			cmd.Stderr = s
 
-			done := make(chan error, 1)
-			go func() { done <- cmd.Run() }()
+			logError := func(f string, v ...interface{}) {
+				log.Printf(f, v...)
+				fmt.Fprintf(s, f, v...)
+			}
+
+			// The pattern with context is described here:
+			// https://blog.golang.org/context
+			c := make(chan error, 1)
+			go func() { c <- cmd.Run() }()
 
 			select {
-			case err := <-done:
-				if err != nil {
-					log.Println("Command execution failed:", err)
-					io.WriteString(s, "Command execution failed: "+err.Error())
-				} else {
-					log.Println("Command execution successful")
-				}
-				s.Exit(cmd.ProcessState.ExitCode())
 
-			case <-s.Context().Done():
-				log.Println("Session closed by remote, killing dangling process")
-				if cmd.Process != nil && cmd.ProcessState == nil {
-					if err := cmd.Process.Kill(); err != nil {
-						log.Println("Failed to kill process:", err)
-					}
+			// cmd.Run() terminated.
+			case err := <-c:
+				if err != nil {
+					logError("Command execution failed: %s\n", err)
+					s.Exit(255)
+					return
 				}
+
+				// No error case.
+				if cmd.ProcessState != nil {
+					s.Exit(cmd.ProcessState.ExitCode())
+				} else {
+					// When the process state is not populated something strange
+					// happenend. I would consider this a bug that I overlooked.
+					logError("Unknown error happenend. Bug?\n")
+					logError("You may report it: https://github.com/Fahrj/reverse-ssh/issues\n")
+				}
+				return
+
+			// cmd.Run() was killed externally.
+			case <-ctx.Done():
+				logError("Command execution failed: %s\n", ctx.Err())
+				s.Exit(254)
+				return
+
+			// The TCP connection died.
+			case <-s.Context().Done():
+				logError("Connection terminated unexpectedly: %s\n", s.Context().Err())
+				return
 			}
 
 		default:

@@ -17,6 +17,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -27,9 +28,13 @@ import (
 )
 
 func createPty(s ssh.Session, shell string) {
-	ptyReq, winCh, _ := s.Pty()
+	var (
+		ptyReq, winCh, _ = s.Pty()
+		ctx, cancel      = context.WithCancel(context.Background())
+		cmd              = exec.CommandContext(ctx, shell)
+	)
+	defer cancel()
 
-	cmd := exec.Command(shell)
 	cmd.Env = append(cmd.Env, fmt.Sprintf("TERM=%s", ptyReq.Term))
 	f, err := pty.Start(cmd)
 	if err != nil {
@@ -45,24 +50,18 @@ func createPty(s ssh.Session, shell string) {
 	go io.Copy(f, s)
 	go io.Copy(s, f)
 
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
+	if err := cmd.Wait(); err != nil {
+		log.Println("Session ended with error:", err)
+		s.Exit(255)
+		return
+	}
 
-	select {
-	case err := <-done:
-		if err != nil {
-			log.Println("Session ended with error:", err)
-		} else {
-			log.Println("Session ended normally")
-		}
+	if cmd.ProcessState != nil {
 		s.Exit(cmd.ProcessState.ExitCode())
-
-	case <-s.Context().Done():
-		log.Println("Session closed by remote, killing dangling process")
-		if cmd.Process != nil && cmd.ProcessState == nil {
-			if err := cmd.Process.Kill(); err != nil {
-				log.Println("Failed to kill process:", err)
-			}
-		}
+	} else {
+		// When the process state is not populated something strange
+		// happenend. I would consider this a bug that I overlooked.
+		log.Printf("Unknown error happenend. Bug?\n")
+		log.Printf("You may report it: https://github.com/Fahrj/reverse-ssh/issues\n")
 	}
 }
