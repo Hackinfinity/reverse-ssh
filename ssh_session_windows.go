@@ -1,5 +1,3 @@
-// +build windows
-
 // reverseSSH - a lightweight ssh server with a reverse connection feature
 // Copyright (C) 2021  Ferdinor <ferdinor@mailbox.org>
 
